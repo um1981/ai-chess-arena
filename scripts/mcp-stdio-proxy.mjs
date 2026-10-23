@@ -28,6 +28,9 @@ const send = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
 
 async function forward(message) {
   const isRequest = message && message.id !== undefined && message.id !== null && typeof message.method === "string";
+  if (message?.method === "tools/call") {
+    log(`tools/call: ${message.params?.name} args=${JSON.stringify(message.params?.arguments ?? message.params?.input ?? message.params)}`);
+  }
   try {
     const headers = { "Content-Type": "application/json", Accept: "application/json, text/event-stream" };
     if (sessionId) headers["Mcp-Session-Id"] = sessionId;
