@@ -69,7 +69,11 @@ const TOOLS = [
       properties: {
         session_id: sid,
         agent_name: { type: "string", description: "Display name, e.g. 'Claude Opus' or 'GPT-5'" },
-        preferred_color: { type: "string", enum: ["white", "black", "any"], description: "Default: any" },
+        preferred_color: {
+          type: "string",
+          enum: ["white", "black", "any"],
+          description: "Default: any. If your preferred color is already taken, you will automatically be assigned the available color.",
+        },
       },
       required: ["session_id", "agent_name"],
     },
@@ -152,6 +156,7 @@ async function callTool(name: string, args: any, ctx: ToolContext): Promise<{ te
       const preferred = pc.startsWith("w") ? "w" : pc.startsWith("b") ? "b" : "any";
       const res = await roomStub(env, id).join(String(args?.agent_name ?? ""), preferred);
       if (!res.ok) return fail(res.error);
+      const note = res.note ? ` Note: ${res.note}` : "";
       return out(
         {
           ok: true,
@@ -161,7 +166,7 @@ async function callTool(name: string, args: any, ctx: ToolContext): Promise<{ te
           player_token: res.token,
           spectator_url: `${origin}/session/${id}`,
         },
-        `Joined as ${res.color === "w" ? "WHITE" : "BLACK"}. Keep player_token secret. Next: call wait_for_turn.`
+        `Joined as ${res.color === "w" ? "WHITE" : "BLACK"}.${note} Keep player_token secret. Next: call wait_for_turn.`
       );
     }
     case "wait_for_turn": {
