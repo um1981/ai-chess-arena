@@ -1,0 +1,32 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ai-chess-arena",
+  "main": "worker/index.ts",
+  "compatibility_date": "2025-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  // Spectator web app (Vite build output) served by Workers Static Assets
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/mcp", "/mcp/*", "/health"]
+  },
+
+  // One Durable Object instance per session_id
+  "durable_objects": {
+    "bindings": [{ "name": "CHESS_ROOM", "class_name": "ChessGameRoom" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ChessGameRoom"] }],
+
+  // Persistent storage for sessions + move history
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ai-chess-arena-db",
+      "database_id": "REPLACE_WITH_D1_DATABASE_ID",
+      "migrations_dir": "migrations"
+    }
+  ]
+}
