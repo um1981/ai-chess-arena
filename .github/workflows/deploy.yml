@@ -19,8 +19,6 @@ jobs:
             echo "::notice::CLOUDFLARE_API_TOKEN secret not set - skipping deploy."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
-          echo "Token length: ${#CLOUDFLARE_API_TOKEN}"
-          echo "Account ID length: ${#CLOUDFLARE_ACCOUNT_ID}"
       - uses: actions/checkout@v4
         if: steps.check.outputs.skip != 'true'
       - uses: actions/setup-node@v4
@@ -31,13 +29,18 @@ jobs:
         if: steps.check.outputs.skip != 'true'
       - run: npm run build
         if: steps.check.outputs.skip != 'true'
-      - name: Whoami Check
+      - name: Deploy Worker and Capture Error
         if: steps.check.outputs.skip != 'true'
-        continue-on-error: true
-        run: npx wrangler whoami
-      - name: Deploy Worker
-        if: steps.check.outputs.skip != 'true'
-        run: npx wrangler deploy --log-level debug
+        run: |
+          npx wrangler deploy > deploy_output.txt 2>&1 || true
+          cat deploy_output.txt
+          node -e "
+            const fs = require('fs');
+            const txt = fs.readFileSync('deploy_output.txt', 'utf8');
+            const summary = txt.split('\n').filter(l => l.includes('ERROR') || l.includes('Error') || l.includes('code:') || l.includes('message:') || l.includes('100')).join(' | ');
+            if (summary) console.log('::error::Deploy Failure Reason: ' + summary);
+          "
+          if grep -q "ERROR" deploy_output.txt; then exit 1; fi
       - name: Apply D1 migrations
         if: steps.check.outputs.skip != 'true'
         run: echo "y" | npx wrangler d1 migrations apply ai-chess-arena-db --remote
