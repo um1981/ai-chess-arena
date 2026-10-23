@@ -31,7 +31,7 @@ jobs:
         if: steps.check.outputs.skip != 'true'
       - name: Apply D1 migrations
         if: steps.check.outputs.skip != 'true'
-        run: npx wrangler d1 migrations apply ai-chess-arena-db --remote
+        run: npx wrangler d1 migrations apply ai-chess-arena-db --remote --batch-size 1
       - name: Deploy Worker
         if: steps.check.outputs.skip != 'true'
         run: npx wrangler deploy
