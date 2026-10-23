@@ -79,7 +79,7 @@ const TOOLS = [
         },
         preferredColor: { type: "string", enum: ["white", "black", "any"], description: "Alias for preferred_color" },
       },
-      required: ["session_id", "agent_name"],
+      required: ["agent_name"],
     },
   },
   {
@@ -91,13 +91,13 @@ const TOOLS = [
       type: "object",
       properties: {
         session_id: sid,
-        sessionId: { type: "string", description: "Alias for session_id" },
+        sessionId: { type: "string", description: "Alias for session_id (optional if player_token provided)" },
         player_token: tok,
         playerToken: { type: "string", description: "Alias for player_token" },
         timeout_seconds: { type: "number", description: "Max seconds to wait (default 45, max 600)" },
         timeoutSeconds: { type: "number", description: "Alias for timeout_seconds" },
       },
-      required: ["session_id", "player_token"],
+      required: ["player_token"],
     },
     annotations: { readOnlyHint: true },
   },
@@ -109,13 +109,13 @@ const TOOLS = [
       type: "object",
       properties: {
         session_id: sid,
-        sessionId: { type: "string", description: "Alias for session_id" },
+        sessionId: { type: "string", description: "Alias for session_id (optional if player_token provided)" },
         player_token: tok,
         playerToken: { type: "string", description: "Alias for player_token" },
         move: { type: "string", description: "Move in SAN or UCI" },
         commentary: { type: "string", description: "Short explanation of your idea (max 1000 chars)" },
       },
-      required: ["session_id", "player_token", "move"],
+      required: ["player_token", "move"],
     },
   },
   {
@@ -128,7 +128,6 @@ const TOOLS = [
         session_id: sid,
         sessionId: { type: "string", description: "Alias for session_id" },
       },
-      required: ["session_id"],
     },
     annotations: { readOnlyHint: true },
   },
@@ -144,7 +143,7 @@ const TOOLS = [
         player_token: tok,
         playerToken: { type: "string", description: "Alias for player_token" },
       },
-      required: ["session_id", "player_token"],
+      required: ["player_token"],
     },
     annotations: { destructiveHint: true },
   },
@@ -219,23 +218,39 @@ async function requireSession(args: any, ctx: ToolContext): Promise<string> {
   }
   if (isValidSessionId(id)) return id;
 
-  // Fallback 1: check ctx.requestSessionId (from headers / query params)
+  // Fallback 1: resolve by player_token if provided in arguments!
+  const token = extractArg(norm, "player_token", "playerToken", "token", "player");
+  if (token && typeof token === "string" && token.trim().length > 10) {
+    try {
+      const row = await ctx.env.DB.prepare(
+        `SELECT session_id FROM chess_sessions WHERE white_token = ?1 OR black_token = ?1 LIMIT 1`
+      ).bind(token.trim()).first<{ session_id: string }>();
+      if (row?.session_id && isValidSessionId(row.session_id)) {
+        console.log(`[requireSession] Resolved session_id from player_token: ${row.session_id}`);
+        return row.session_id;
+      }
+    } catch (err) {
+      console.error("Failed to resolve session by token:", err);
+    }
+  }
+
+  // Fallback 2: check ctx.requestSessionId (from headers / query params)
   if (ctx.requestSessionId && isValidSessionId(ctx.requestSessionId)) {
     console.log(`[requireSession] Used requestSessionId: ${ctx.requestSessionId}`);
     return ctx.requestSessionId;
   }
 
-  // Fallback 2: auto-resolve to the active waiting session from D1!
+  // Fallback 3: auto-resolve to the latest active (playing or waiting) session from D1!
   try {
     const latest = await ctx.env.DB.prepare(
-      `SELECT session_id FROM chess_sessions WHERE status = 'waiting' ORDER BY updated_at DESC LIMIT 1`
+      `SELECT session_id FROM chess_sessions WHERE status IN ('playing', 'waiting') ORDER BY updated_at DESC LIMIT 1`
     ).first<{ session_id: string }>();
     if (latest?.session_id && isValidSessionId(latest.session_id)) {
-      console.log(`[requireSession] Auto-resolved omitted session_id to active waiting session: ${latest.session_id}`);
+      console.log(`[requireSession] Auto-resolved to active session: ${latest.session_id}`);
       return latest.session_id;
     }
   } catch (err) {
-    console.error("Failed to auto-resolve waiting session:", err);
+    console.error("Failed to auto-resolve active session:", err);
   }
 
   throw new ToolError(`Invalid or missing session_id (received: ${JSON.stringify(args)})`);
