@@ -35,6 +35,7 @@ interface ToolContext {
   env: Env;
   origin: string;
   progress?: (message: string) => void;
+  requestSessionId?: string | null;
 }
 
 const sid = { type: "string", description: "Session ID (e.g. cfjn-vxzd) shown on spectator web page or in list_sessions" };
@@ -78,6 +79,7 @@ const TOOLS = [
         },
         preferredColor: { type: "string", enum: ["white", "black", "any"], description: "Alias for preferred_color" },
       },
+      required: ["session_id", "agent_name"],
     },
   },
   {
@@ -95,6 +97,7 @@ const TOOLS = [
         timeout_seconds: { type: "number", description: "Max seconds to wait (default 45, max 600)" },
         timeoutSeconds: { type: "number", description: "Alias for timeout_seconds" },
       },
+      required: ["session_id", "player_token"],
     },
     annotations: { readOnlyHint: true },
   },
@@ -112,6 +115,7 @@ const TOOLS = [
         move: { type: "string", description: "Move in SAN or UCI" },
         commentary: { type: "string", description: "Short explanation of your idea (max 1000 chars)" },
       },
+      required: ["session_id", "player_token", "move"],
     },
   },
   {
@@ -124,6 +128,7 @@ const TOOLS = [
         session_id: sid,
         sessionId: { type: "string", description: "Alias for session_id" },
       },
+      required: ["session_id"],
     },
     annotations: { readOnlyHint: true },
   },
@@ -139,6 +144,7 @@ const TOOLS = [
         player_token: tok,
         playerToken: { type: "string", description: "Alias for player_token" },
       },
+      required: ["session_id", "player_token"],
     },
     annotations: { destructiveHint: true },
   },
@@ -197,7 +203,7 @@ function extractArg(args: any, ...keys: string[]): any {
   return undefined;
 }
 
-function requireSession(args: any): string {
+async function requireSession(args: any, ctx: ToolContext): Promise<string> {
   const norm = normalizeArgs(args);
   let raw: any = undefined;
   if (norm && typeof norm === "object") {
@@ -211,10 +217,28 @@ function requireSession(args: any): string {
     const match = id.match(/([a-zA-Z0-9]{4}-[a-zA-Z0-9]{4}|[a-zA-Z0-9_-]{3,64})$/);
     if (match) id = match[1];
   }
-  if (!isValidSessionId(id)) {
-    throw new ToolError(`Invalid or missing session_id (received: ${JSON.stringify(args)})`);
+  if (isValidSessionId(id)) return id;
+
+  // Fallback 1: check ctx.requestSessionId (from headers / query params)
+  if (ctx.requestSessionId && isValidSessionId(ctx.requestSessionId)) {
+    console.log(`[requireSession] Used requestSessionId: ${ctx.requestSessionId}`);
+    return ctx.requestSessionId;
   }
-  return id;
+
+  // Fallback 2: auto-resolve to the active waiting session from D1!
+  try {
+    const latest = await ctx.env.DB.prepare(
+      `SELECT session_id FROM chess_sessions WHERE status = 'waiting' ORDER BY updated_at DESC LIMIT 1`
+    ).first<{ session_id: string }>();
+    if (latest?.session_id && isValidSessionId(latest.session_id)) {
+      console.log(`[requireSession] Auto-resolved omitted session_id to active waiting session: ${latest.session_id}`);
+      return latest.session_id;
+    }
+  } catch (err) {
+    console.error("Failed to auto-resolve waiting session:", err);
+  }
+
+  throw new ToolError(`Invalid or missing session_id (received: ${JSON.stringify(args)})`);
 }
 
 async function callTool(name: string, args: any, ctx: ToolContext): Promise<{ text: string; data: unknown; isError?: boolean }> {
@@ -237,7 +261,7 @@ async function callTool(name: string, args: any, ctx: ToolContext): Promise<{ te
       );
     }
     case "join_session": {
-      const id = requireSession(args);
+      const id = await requireSession(args, ctx);
       const agentName = String(extractArg(args, "agent_name", "agentName", "name", "agent") ?? "").trim() || "Anonymous Agent";
       const pc = String(extractArg(args, "preferred_color", "preferredColor", "color") ?? "any").toLowerCase();
       const preferred = pc.startsWith("w") ? "w" : pc.startsWith("b") ? "b" : "any";
@@ -257,7 +281,7 @@ async function callTool(name: string, args: any, ctx: ToolContext): Promise<{ te
       );
     }
     case "wait_for_turn": {
-      const id = requireSession(args);
+      const id = await requireSession(args, ctx);
       const token = String(extractArg(args, "player_token", "playerToken", "token", "player") ?? "").trim();
       if (!token) return fail("Missing player_token");
       const timeoutRaw = extractArg(args, "timeout_seconds", "timeoutSeconds", "timeout", "seconds");
@@ -301,7 +325,7 @@ async function callTool(name: string, args: any, ctx: ToolContext): Promise<{ te
       };
     }
     case "make_move": {
-      const id = requireSession(args);
+      const id = await requireSession(args, ctx);
       const token = String(extractArg(args, "player_token", "playerToken", "token", "player") ?? "").trim();
       if (!token) return fail("Missing player_token");
       const move = String(extractArg(args, "move", "move_san", "move_uci", "san", "uci") ?? "").trim();
@@ -323,13 +347,13 @@ async function callTool(name: string, args: any, ctx: ToolContext): Promise<{ te
       );
     }
     case "get_game_state": {
-      const id = requireSession(args);
+      const id = await requireSession(args, ctx);
       const state = await roomStub(env, id).getState();
       if (!state) return fail("Session not found");
       return out({ ...state, spectator_url: `${origin}/session/${id}` });
     }
     case "resign": {
-      const id = requireSession(args);
+      const id = await requireSession(args, ctx);
       const token = String(extractArg(args, "player_token", "playerToken", "token", "player") ?? "").trim();
       if (!token) return fail("Missing player_token");
       const res = await roomStub(env, id).resign(token);
@@ -406,17 +430,28 @@ async function handleRpc(msg: JsonRpcRequest, ctx: ToolContext): Promise<object 
       }
       case "tools/call": {
         const name = msg.params?.name;
-        const rawArgs =
-          msg.params?.arguments !== undefined
-            ? msg.params.arguments
-            : msg.params?.input !== undefined
-            ? msg.params.input
-            : msg.params?.parameters !== undefined
-            ? msg.params.parameters
-            : msg.params?.args !== undefined
-            ? msg.params.args
-            : msg.params ?? {};
-        const args = normalizeArgs(rawArgs);
+        // Merge msg.params and all its sub-objects so NO property is EVER lost:
+        const paramObj = typeof msg.params === "object" && msg.params !== null ? msg.params : {};
+        const argsObj = typeof msg.params?.arguments === "object" && msg.params?.arguments !== null ? msg.params.arguments : {};
+        const inputObj = typeof msg.params?.input === "object" && msg.params?.input !== null ? msg.params.input : {};
+        const metaObj = typeof msg.params?._meta === "object" && msg.params?._meta !== null ? msg.params._meta : {};
+        const msgObj = typeof (msg as any).session_id === "string" ? { session_id: (msg as any).session_id } : {};
+        const merged = {
+          ...paramObj,
+          ...argsObj,
+          ...inputObj,
+          ...metaObj,
+          ...msgObj,
+        };
+        if (typeof msg.params?.arguments === "string") {
+          try {
+            Object.assign(merged, JSON.parse(msg.params.arguments));
+          } catch {
+            if (!merged.session_id) merged.session_id = msg.params.arguments;
+          }
+        }
+        delete merged.name; // don't confuse name with tool args
+        const args = normalizeArgs(merged);
         console.log(`[MCP tools/call] ${name}:`, JSON.stringify(args));
         try {
           const r = await callTool(name, args, ctx);
@@ -480,10 +515,15 @@ export async function handleMcp(request: Request, env: Env): Promise<Response> {
     return new Response(null, { status: 202, headers: CORS });
   }
   const origin = new URL(request.url).origin;
+  const urlObj = new URL(request.url);
+  const headerSessionId = request.headers.get("mcp-session-id") || request.headers.get("x-session-id");
+  const querySessionId = urlObj.searchParams.get("session_id") || urlObj.searchParams.get("sessionId");
+  const requestSessionId = (headerSessionId || querySessionId)?.trim() || null;
+  const ctx: ToolContext = { env, origin, requestSessionId };
   const hasRequests = messages.some((m) => m.id !== undefined && m.id !== null);
 
   if (!hasRequests) {
-    await Promise.all(messages.map((m) => handleRpc(m, { env, origin })));
+    await Promise.all(messages.map((m) => handleRpc(m, ctx)));
     return new Response(null, { status: 202, headers: CORS });
   }
 
@@ -492,7 +532,7 @@ export async function handleMcp(request: Request, env: Env): Promise<Response> {
     messages.some((m) => m.method === "tools/call" && LONG_RUNNING_TOOLS.has(m.params?.name));
 
   if (!wantsSse) {
-    const results = (await Promise.all(messages.map((m) => handleRpc(m, { env, origin })))).filter(Boolean);
+    const results = (await Promise.all(messages.map((m) => handleRpc(m, ctx)))).filter(Boolean);
     return json(batch ? results : results[0]);
   }
 
@@ -517,7 +557,7 @@ export async function handleMcp(request: Request, env: Env): Promise<Response> {
   const work = (async () => {
     try {
       write(": connected\n\n");
-      const results = await Promise.all(messages.map((m) => handleRpc(m, { env, origin })));
+      const results = await Promise.all(messages.map((m) => handleRpc(m, ctx)));
       for (const r of results) if (r) await sendEvent(r);
     } finally {
       clearInterval(keepAlive);
