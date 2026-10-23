@@ -1,0 +1,99 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", "Segoe UI Variable", "Segoe UI", "Leelawadee UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", Consolas, ui-monospace, monospace;
+  --color-neon-cyan: #22d3ee;
+  --color-neon-pink: #e879f9;
+  --color-neon-lime: #a3e635;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  background:
+    radial-gradient(1200px 600px at 10% -10%, rgba(34, 211, 238, 0.12), transparent 60%),
+    radial-gradient(900px 500px at 110% 10%, rgba(232, 121, 249, 0.12), transparent 60%),
+    #070a13;
+  background-attachment: fixed;
+}
+
+.glass {
+  background: linear-gradient(180deg, rgba(17, 24, 39, 0.78), rgba(10, 14, 26, 0.78));
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.02) inset,
+    0 20px 40px -20px rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(12px);
+}
+
+.grid-bg {
+  background-image:
+    linear-gradient(rgba(148, 163, 184, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(148, 163, 184, 0.05) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+
+.piece {
+  font-family: "Segoe UI Symbol", "Noto Sans Symbols 2", "DejaVu Sans", "Arial Unicode MS", serif;
+  line-height: 1;
+  user-select: none;
+  font-variant-emoji: text;
+}
+.piece-w {
+  color: #f8fafc;
+  text-shadow:
+    0 0 1px #0b1020,
+    1px 1px 0 #0b1020,
+    -1px -1px 0 #0b1020,
+    1px -1px 0 #0b1020,
+    -1px 1px 0 #0b1020,
+    0 4px 8px rgba(0, 0, 0, 0.55);
+}
+.piece-b {
+  color: #0b1020;
+  text-shadow:
+    1px 1px 0 rgba(226, 232, 240, 0.55),
+    -1px -1px 0 rgba(226, 232, 240, 0.55),
+    1px -1px 0 rgba(226, 232, 240, 0.55),
+    -1px 1px 0 rgba(226, 232, 240, 0.55),
+    0 4px 8px rgba(0, 0, 0, 0.55);
+}
+
+@keyframes land {
+  0% {
+    transform: scale(1.35);
+    opacity: 0.2;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+.animate-land {
+  animation: land 260ms cubic-bezier(0.2, 0.9, 0.3, 1.2);
+}
+
+@keyframes pulse-ring {
+  0% {
+    box-shadow: 0 0 0 0 rgba(34, 211, 238, 0.55);
+  }
+  100% {
+    box-shadow: 0 0 0 14px rgba(34, 211, 238, 0);
+  }
+}
+.pulse-ring {
+  animation: pulse-ring 1.6s ease-out infinite;
+}
+
+.scrollbar-thin::-webkit-scrollbar {
+  width: 6px;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.25);
+  border-radius: 999px;
+}
