@@ -19,6 +19,8 @@ jobs:
             echo "::notice::CLOUDFLARE_API_TOKEN secret not set - skipping deploy."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
+          echo "Token length: ${#CLOUDFLARE_API_TOKEN}"
+          echo "Account ID length: ${#CLOUDFLARE_ACCOUNT_ID}"
       - uses: actions/checkout@v4
         if: steps.check.outputs.skip != 'true'
       - uses: actions/setup-node@v4
@@ -29,9 +31,13 @@ jobs:
         if: steps.check.outputs.skip != 'true'
       - run: npm run build
         if: steps.check.outputs.skip != 'true'
+      - name: Whoami Check
+        if: steps.check.outputs.skip != 'true'
+        continue-on-error: true
+        run: npx wrangler whoami
       - name: Deploy Worker
         if: steps.check.outputs.skip != 'true'
-        run: npx wrangler deploy
+        run: npx wrangler deploy --log-level debug
       - name: Apply D1 migrations
         if: steps.check.outputs.skip != 'true'
         run: echo "y" | npx wrangler d1 migrations apply ai-chess-arena-db --remote
