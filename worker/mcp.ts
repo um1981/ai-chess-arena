@@ -146,13 +146,49 @@ const TOOLS = [
 
 class ToolError extends Error {}
 
+function normalizeArgs(args: any): any {
+  if (args === null || args === undefined) return {};
+  if (typeof args === "string") {
+    const trimmed = args.trim();
+    if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+      try {
+        return normalizeArgs(JSON.parse(trimmed));
+      } catch {
+        return { session_id: trimmed };
+      }
+    }
+    return { session_id: trimmed };
+  }
+  if (Array.isArray(args)) {
+    if (args.length === 1) return normalizeArgs(args[0]);
+    return { session_id: args[0], player_token: args[1], move: args[2] };
+  }
+  if (typeof args === "object") {
+    let result = { ...args };
+    if (result.arguments) {
+      const nested = normalizeArgs(result.arguments);
+      result = { ...result, ...nested };
+    }
+    if (result.input) {
+      const nested = normalizeArgs(result.input);
+      result = { ...result, ...nested };
+    }
+    if (result.parameters) {
+      const nested = normalizeArgs(result.parameters);
+      result = { ...result, ...nested };
+    }
+    return result;
+  }
+  return args;
+}
+
 function extractArg(args: any, ...keys: string[]): any {
-  if (!args) return undefined;
-  if (typeof args !== "object") return undefined;
+  const norm = normalizeArgs(args);
+  if (!norm || typeof norm !== "object") return undefined;
   for (const k of keys) {
-    if (args[k] !== undefined && args[k] !== null) return args[k];
+    if (norm[k] !== undefined && norm[k] !== null) return norm[k];
     const lower = k.toLowerCase().replace(/_/g, "");
-    for (const [key, val] of Object.entries(args)) {
+    for (const [key, val] of Object.entries(norm)) {
       if (key.toLowerCase().replace(/_/g, "") === lower && val !== undefined && val !== null) {
         return val;
       }
@@ -162,13 +198,12 @@ function extractArg(args: any, ...keys: string[]): any {
 }
 
 function requireSession(args: any): string {
+  const norm = normalizeArgs(args);
   let raw: any = undefined;
-  if (typeof args === "string") {
-    raw = args;
-  } else if (Array.isArray(args) && args.length > 0) {
-    raw = typeof args[0] === "string" ? args[0] : extractArg(args[0], "session_id", "sessionId", "id", "session");
-  } else if (args && typeof args === "object") {
-    raw = extractArg(args, "session_id", "sessionId", "sessionID", "id", "session", "room_id", "roomId");
+  if (norm && typeof norm === "object") {
+    raw = extractArg(norm, "session_id", "sessionId", "sessionID", "id", "session", "room_id", "roomId");
+  } else if (typeof norm === "string") {
+    raw = norm;
   }
   let id = String(raw ?? "").trim().replace(/^["']|["']$/g, "");
   // If a full URL or path was passed (e.g. https://.../session/cfjn-vxzd or /session/cfjn-vxzd)
@@ -176,7 +211,9 @@ function requireSession(args: any): string {
     const match = id.match(/([a-zA-Z0-9]{4}-[a-zA-Z0-9]{4}|[a-zA-Z0-9_-]{3,64})$/);
     if (match) id = match[1];
   }
-  if (!isValidSessionId(id)) throw new ToolError("Invalid or missing session_id");
+  if (!isValidSessionId(id)) {
+    throw new ToolError(`Invalid or missing session_id (received: ${JSON.stringify(args)})`);
+  }
   return id;
 }
 
@@ -369,8 +406,20 @@ async function handleRpc(msg: JsonRpcRequest, ctx: ToolContext): Promise<object 
       }
       case "tools/call": {
         const name = msg.params?.name;
+        const rawArgs =
+          msg.params?.arguments !== undefined
+            ? msg.params.arguments
+            : msg.params?.input !== undefined
+            ? msg.params.input
+            : msg.params?.parameters !== undefined
+            ? msg.params.parameters
+            : msg.params?.args !== undefined
+            ? msg.params.args
+            : msg.params ?? {};
+        const args = normalizeArgs(rawArgs);
+        console.log(`[MCP tools/call] ${name}:`, JSON.stringify(args));
         try {
-          const r = await callTool(name, msg.params?.arguments ?? {}, ctx);
+          const r = await callTool(name, args, ctx);
           result = {
             content: [{ type: "text", text: r.text }],
             structuredContent: r.data && typeof r.data === "object" ? r.data : undefined,
