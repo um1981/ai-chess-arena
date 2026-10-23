@@ -37,7 +37,7 @@ interface ToolContext {
   progress?: (message: string) => void;
 }
 
-const sid = { type: "string", description: "Session ID (e.g. ab12-cd34) shown on the spectator web page" };
+const sid = { type: "string", description: "Session ID (e.g. cfjn-vxzd) shown on spectator web page or in list_sessions" };
 const tok = { type: "string", description: "Secret player_token returned by join_session" };
 
 const TOOLS = [
@@ -68,14 +68,16 @@ const TOOLS = [
       type: "object",
       properties: {
         session_id: sid,
+        sessionId: { type: "string", description: "Alias for session_id" },
         agent_name: { type: "string", description: "Display name, e.g. 'Claude Opus' or 'GPT-5'" },
+        agentName: { type: "string", description: "Alias for agent_name" },
         preferred_color: {
           type: "string",
           enum: ["white", "black", "any"],
           description: "Default: any. If your preferred color is already taken, you will automatically be assigned the available color.",
         },
+        preferredColor: { type: "string", enum: ["white", "black", "any"], description: "Alias for preferred_color" },
       },
-      required: ["session_id", "agent_name"],
     },
   },
   {
@@ -87,10 +89,12 @@ const TOOLS = [
       type: "object",
       properties: {
         session_id: sid,
+        sessionId: { type: "string", description: "Alias for session_id" },
         player_token: tok,
+        playerToken: { type: "string", description: "Alias for player_token" },
         timeout_seconds: { type: "number", description: "Max seconds to wait (default 45, max 600)" },
+        timeoutSeconds: { type: "number", description: "Alias for timeout_seconds" },
       },
-      required: ["session_id", "player_token"],
     },
     annotations: { readOnlyHint: true },
   },
@@ -102,33 +106,76 @@ const TOOLS = [
       type: "object",
       properties: {
         session_id: sid,
+        sessionId: { type: "string", description: "Alias for session_id" },
         player_token: tok,
+        playerToken: { type: "string", description: "Alias for player_token" },
         move: { type: "string", description: "Move in SAN or UCI" },
         commentary: { type: "string", description: "Short explanation of your idea (max 1000 chars)" },
       },
-      required: ["session_id", "player_token", "move"],
     },
   },
   {
     name: "get_game_state",
     title: "Get game state",
     description: "Get the full current state of a session (FEN, PGN, clocks, move list). Does not require a token.",
-    inputSchema: { type: "object", properties: { session_id: sid }, required: ["session_id"] },
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: sid,
+        sessionId: { type: "string", description: "Alias for session_id" },
+      },
+    },
     annotations: { readOnlyHint: true },
   },
   {
     name: "resign",
     title: "Resign",
     description: "Resign the game (your opponent wins).",
-    inputSchema: { type: "object", properties: { session_id: sid, player_token: tok }, required: ["session_id", "player_token"] },
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: sid,
+        sessionId: { type: "string", description: "Alias for session_id" },
+        player_token: tok,
+        playerToken: { type: "string", description: "Alias for player_token" },
+      },
+    },
     annotations: { destructiveHint: true },
   },
 ];
 
 class ToolError extends Error {}
 
+function extractArg(args: any, ...keys: string[]): any {
+  if (!args) return undefined;
+  if (typeof args !== "object") return undefined;
+  for (const k of keys) {
+    if (args[k] !== undefined && args[k] !== null) return args[k];
+    const lower = k.toLowerCase().replace(/_/g, "");
+    for (const [key, val] of Object.entries(args)) {
+      if (key.toLowerCase().replace(/_/g, "") === lower && val !== undefined && val !== null) {
+        return val;
+      }
+    }
+  }
+  return undefined;
+}
+
 function requireSession(args: any): string {
-  const id = String(args?.session_id ?? "").trim();
+  let raw: any = undefined;
+  if (typeof args === "string") {
+    raw = args;
+  } else if (Array.isArray(args) && args.length > 0) {
+    raw = typeof args[0] === "string" ? args[0] : extractArg(args[0], "session_id", "sessionId", "id", "session");
+  } else if (args && typeof args === "object") {
+    raw = extractArg(args, "session_id", "sessionId", "sessionID", "id", "session", "room_id", "roomId");
+  }
+  let id = String(raw ?? "").trim().replace(/^["']|["']$/g, "");
+  // If a full URL or path was passed (e.g. https://.../session/cfjn-vxzd or /session/cfjn-vxzd)
+  if (id.includes("/")) {
+    const match = id.match(/([a-zA-Z0-9]{4}-[a-zA-Z0-9]{4}|[a-zA-Z0-9_-]{3,64})$/);
+    if (match) id = match[1];
+  }
   if (!isValidSessionId(id)) throw new ToolError("Invalid or missing session_id");
   return id;
 }
@@ -140,7 +187,9 @@ async function callTool(name: string, args: any, ctx: ToolContext): Promise<{ te
 
   switch (name) {
     case "list_sessions": {
-      const rows = await listSessions(env, { status: args?.status, limit: args?.limit ?? 20 });
+      const status = extractArg(args, "status", "state");
+      const limit = Number(extractArg(args, "limit", "count", "max") ?? 20);
+      const rows = await listSessions(env, { status, limit });
       return out({ sessions: rows });
     }
     case "create_session": {
@@ -152,9 +201,10 @@ async function callTool(name: string, args: any, ctx: ToolContext): Promise<{ te
     }
     case "join_session": {
       const id = requireSession(args);
-      const pc = String(args?.preferred_color ?? "any").toLowerCase();
+      const agentName = String(extractArg(args, "agent_name", "agentName", "name", "agent") ?? "").trim() || "Anonymous Agent";
+      const pc = String(extractArg(args, "preferred_color", "preferredColor", "color") ?? "any").toLowerCase();
       const preferred = pc.startsWith("w") ? "w" : pc.startsWith("b") ? "b" : "any";
-      const res = await roomStub(env, id).join(String(args?.agent_name ?? ""), preferred);
+      const res = await roomStub(env, id).join(agentName, preferred);
       if (!res.ok) return fail(res.error);
       const note = res.note ? ` Note: ${res.note}` : "";
       return out(
@@ -171,9 +221,12 @@ async function callTool(name: string, args: any, ctx: ToolContext): Promise<{ te
     }
     case "wait_for_turn": {
       const id = requireSession(args);
-      const timeout = Math.max(1, Math.min(Number(args?.timeout_seconds ?? 45) || 45, 600));
+      const token = String(extractArg(args, "player_token", "playerToken", "token", "player") ?? "").trim();
+      if (!token) return fail("Missing player_token");
+      const timeoutRaw = extractArg(args, "timeout_seconds", "timeoutSeconds", "timeout", "seconds");
+      const timeout = Math.max(1, Math.min(Number(timeoutRaw ?? 45) || 45, 600));
       ctx.progress?.("Waiting for turn...");
-      const res = await roomStub(env, id).waitForTurn(String(args?.player_token ?? ""), timeout * 1000);
+      const res = await roomStub(env, id).waitForTurn(token, timeout * 1000);
       if (!res.ok) return fail(res.error);
       const t = res.turn;
       const s = t.state;
@@ -212,7 +265,12 @@ async function callTool(name: string, args: any, ctx: ToolContext): Promise<{ te
     }
     case "make_move": {
       const id = requireSession(args);
-      const res = await roomStub(env, id).move(String(args?.player_token ?? ""), String(args?.move ?? ""), args?.commentary);
+      const token = String(extractArg(args, "player_token", "playerToken", "token", "player") ?? "").trim();
+      if (!token) return fail("Missing player_token");
+      const move = String(extractArg(args, "move", "move_san", "move_uci", "san", "uci") ?? "").trim();
+      if (!move) return fail("Missing move");
+      const commentary = extractArg(args, "commentary", "comment", "note");
+      const res = await roomStub(env, id).move(token, move, commentary);
       if (!res.ok) return fail(res.error);
       return out(
         {
@@ -235,7 +293,9 @@ async function callTool(name: string, args: any, ctx: ToolContext): Promise<{ te
     }
     case "resign": {
       const id = requireSession(args);
-      const res = await roomStub(env, id).resign(String(args?.player_token ?? ""));
+      const token = String(extractArg(args, "player_token", "playerToken", "token", "player") ?? "").trim();
+      if (!token) return fail("Missing player_token");
+      const res = await roomStub(env, id).resign(token);
       if (!res.ok) return fail(res.error);
       return out({ ok: true, winner: res.state.winner, end_reason: res.state.endReason }, "You resigned.");
     }
