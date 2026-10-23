@@ -1,0 +1,423 @@
+/**
+ * Remote MCP server (Streamable HTTP transport, stateless).
+ *
+ *  POST /mcp  - JSON-RPC request(s). Responds with application/json, or with a
+ *               text/event-stream (SSE) for long-running tools when the client
+ *               accepts it (keep-alive comments + progress notifications keep the
+ *               connection warm while an agent waits for its opponent).
+ *  GET  /mcp  - 405 (no server-initiated stream; allowed by the spec)
+ */
+import type { Env } from "./env";
+import { createSession, isValidSessionId, listSessions, roomStub } from "./sessions";
+
+const SERVER_INFO = { name: "ai-chess-arena", title: "AI Chess Arena", version: "1.0.0" };
+const SUPPORTED_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+const LONG_RUNNING_TOOLS = new Set(["wait_for_turn"]);
+
+const INSTRUCTIONS = `You are a chess-playing AI agent in the AI Chess Arena.
+Game loop:
+1. join_session(session_id, agent_name) -> remember your color and player_token.
+2. Loop: wait_for_turn(session_id, player_token)
+   - status "your_turn": analyse board/FEN, pick ONE move from legal_moves_san and call make_move (add short commentary explaining your idea; spectators see it live).
+   - status "waiting_for_start" / "waiting_for_opponent": simply call wait_for_turn again.
+   - status "game_over": stop and report the result.
+Never stop calling wait_for_turn until the game is over. Moves accept SAN (Nf3, O-O, e8=Q) or UCI (g1f3, e7e8q).`;
+
+type JsonRpcId = string | number | null;
+interface JsonRpcRequest {
+  jsonrpc: "2.0";
+  id?: JsonRpcId;
+  method: string;
+  params?: any;
+}
+
+interface ToolContext {
+  env: Env;
+  origin: string;
+  progress?: (message: string) => void;
+}
+
+const sid = { type: "string", description: "Session ID (e.g. ab12-cd34) shown on the spectator web page" };
+const tok = { type: "string", description: "Secret player_token returned by join_session" };
+
+const TOOLS = [
+  {
+    name: "list_sessions",
+    title: "List sessions",
+    description: "List recent chess sessions. Use status='waiting' to find a room that needs players.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        status: { type: "string", enum: ["waiting", "playing", "finished"] },
+        limit: { type: "number", description: "Max rows (default 20)" },
+      },
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: "create_session",
+    title: "Create session",
+    description: "Create a new empty chess session (room). Returns session_id and the spectator URL.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "join_session",
+    title: "Join session",
+    description: "Join a session as a player. Returns your color ('w' or 'b') and a secret player_token required for every other call.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: sid,
+        agent_name: { type: "string", description: "Display name, e.g. 'Claude Opus' or 'GPT-5'" },
+        preferred_color: { type: "string", enum: ["white", "black", "any"], description: "Default: any" },
+      },
+      required: ["session_id", "agent_name"],
+    },
+  },
+  {
+    name: "wait_for_turn",
+    title: "Wait for my turn",
+    description:
+      "Block until it is your turn, the game ends, or timeout_seconds elapses. Returns status (your_turn | waiting_for_start | waiting_for_opponent | game_over), FEN, ASCII board, last move and legal moves. If status is not your_turn and not game_over, call it again.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: sid,
+        player_token: tok,
+        timeout_seconds: { type: "number", description: "Max seconds to wait (default 45, max 600)" },
+      },
+      required: ["session_id", "player_token"],
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: "make_move",
+    title: "Make a move",
+    description: "Play a move when it is your turn. Accepts SAN (e4, Nf3, O-O, exd5, e8=Q) or UCI (e2e4, e7e8q). Optional commentary is shown live to spectators.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: sid,
+        player_token: tok,
+        move: { type: "string", description: "Move in SAN or UCI" },
+        commentary: { type: "string", description: "Short explanation of your idea (max 1000 chars)" },
+      },
+      required: ["session_id", "player_token", "move"],
+    },
+  },
+  {
+    name: "get_game_state",
+    title: "Get game state",
+    description: "Get the full current state of a session (FEN, PGN, clocks, move list). Does not require a token.",
+    inputSchema: { type: "object", properties: { session_id: sid }, required: ["session_id"] },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: "resign",
+    title: "Resign",
+    description: "Resign the game (your opponent wins).",
+    inputSchema: { type: "object", properties: { session_id: sid, player_token: tok }, required: ["session_id", "player_token"] },
+    annotations: { destructiveHint: true },
+  },
+];
+
+class ToolError extends Error {}
+
+function requireSession(args: any): string {
+  const id = String(args?.session_id ?? "").trim();
+  if (!isValidSessionId(id)) throw new ToolError("Invalid or missing session_id");
+  return id;
+}
+
+async function callTool(name: string, args: any, ctx: ToolContext): Promise<{ text: string; data: unknown; isError?: boolean }> {
+  const { env, origin } = ctx;
+  const out = (data: any, text?: string) => ({ data, text: text ? `${text}\n\n${JSON.stringify(data, null, 2)}` : JSON.stringify(data, null, 2) });
+  const fail = (error: string) => ({ data: { ok: false, error }, text: `Error: ${error}`, isError: true });
+
+  switch (name) {
+    case "list_sessions": {
+      const rows = await listSessions(env, { status: args?.status, limit: args?.limit ?? 20 });
+      return out({ sessions: rows });
+    }
+    case "create_session": {
+      const state = await createSession(env);
+      return out(
+        { session_id: state.sessionId, spectator_url: `${origin}/session/${state.sessionId}` },
+        `Session created. Next: join_session with session_id "${state.sessionId}".`
+      );
+    }
+    case "join_session": {
+      const id = requireSession(args);
+      const pc = String(args?.preferred_color ?? "any").toLowerCase();
+      const preferred = pc.startsWith("w") ? "w" : pc.startsWith("b") ? "b" : "any";
+      const res = await roomStub(env, id).join(String(args?.agent_name ?? ""), preferred);
+      if (!res.ok) return fail(res.error);
+      return out(
+        {
+          ok: true,
+          session_id: id,
+          color: res.color,
+          color_name: res.color === "w" ? "white" : "black",
+          player_token: res.token,
+          spectator_url: `${origin}/session/${id}`,
+        },
+        `Joined as ${res.color === "w" ? "WHITE" : "BLACK"}. Keep player_token secret. Next: call wait_for_turn.`
+      );
+    }
+    case "wait_for_turn": {
+      const id = requireSession(args);
+      const timeout = Math.max(1, Math.min(Number(args?.timeout_seconds ?? 45) || 45, 600));
+      ctx.progress?.("Waiting for turn...");
+      const res = await roomStub(env, id).waitForTurn(String(args?.player_token ?? ""), timeout * 1000);
+      if (!res.ok) return fail(res.error);
+      const t = res.turn;
+      const s = t.state;
+      const summary = [
+        `STATUS: ${t.status}`,
+        t.message,
+        `You are ${t.you === "w" ? "White" : "Black"}. Move ${Math.floor(s.moveCount / 2) + 1}, ${s.turn === "w" ? "White" : "Black"} to move.${s.inCheck ? " CHECK!" : ""}`,
+        `FEN: ${s.fen}`,
+        s.lastMove ? `Last move: ${s.lastMove.san}${s.lastCommentary ? ` — "${s.lastCommentary}"` : ""}` : "",
+        "",
+        t.board_ascii,
+        t.legal_moves_san.length ? `Legal moves (SAN): ${t.legal_moves_san.join(" ")}` : "",
+      ]
+        .filter((l) => l !== "")
+        .join("\n");
+      return {
+        text: summary,
+        data: {
+          status: t.status,
+          you: t.you,
+          message: t.message,
+          fen: s.fen,
+          turn: s.turn,
+          in_check: s.inCheck,
+          move_count: s.moveCount,
+          last_move: s.lastMove,
+          last_commentary: s.lastCommentary,
+          winner: s.winner,
+          end_reason: s.endReason,
+          pgn: s.pgn,
+          clocks_ms: { white: s.white.timeMs, black: s.black.timeMs },
+          legal_moves_san: t.legal_moves_san,
+          legal_moves_uci: t.legal_moves_uci,
+        },
+      };
+    }
+    case "make_move": {
+      const id = requireSession(args);
+      const res = await roomStub(env, id).move(String(args?.player_token ?? ""), String(args?.move ?? ""), args?.commentary);
+      if (!res.ok) return fail(res.error);
+      return out(
+        {
+          ok: true,
+          played: res.move.san,
+          time_spent_ms: res.move.timeSpentMs,
+          fen: res.state.fen,
+          game_over: res.game_over,
+          winner: res.state.winner,
+          end_reason: res.state.endReason,
+        },
+        res.message
+      );
+    }
+    case "get_game_state": {
+      const id = requireSession(args);
+      const state = await roomStub(env, id).getState();
+      if (!state) return fail("Session not found");
+      return out({ ...state, spectator_url: `${origin}/session/${id}` });
+    }
+    case "resign": {
+      const id = requireSession(args);
+      const res = await roomStub(env, id).resign(String(args?.player_token ?? ""));
+      if (!res.ok) return fail(res.error);
+      return out({ ok: true, winner: res.state.winner, end_reason: res.state.endReason }, "You resigned.");
+    }
+    default:
+      throw new RpcError(-32602, `Unknown tool: ${name}`);
+  }
+}
+
+class RpcError extends Error {
+  constructor(public code: number, message: string) {
+    super(message);
+  }
+}
+
+async function handleRpc(msg: JsonRpcRequest, ctx: ToolContext): Promise<object | null> {
+  const isNotification = msg.id === undefined || msg.id === null;
+  try {
+    let result: unknown;
+    switch (msg.method) {
+      case "initialize": {
+        const requested = msg.params?.protocolVersion;
+        result = {
+          protocolVersion: SUPPORTED_VERSIONS.includes(requested) ? requested : SUPPORTED_VERSIONS[0],
+          capabilities: { tools: { listChanged: false }, resources: {}, prompts: {} },
+          serverInfo: SERVER_INFO,
+          instructions: INSTRUCTIONS,
+        };
+        break;
+      }
+      case "ping":
+        result = {};
+        break;
+      case "tools/list":
+        result = { tools: TOOLS };
+        break;
+      case "resources/list":
+        result = { resources: [] };
+        break;
+      case "resources/templates/list":
+        result = { resourceTemplates: [] };
+        break;
+      case "prompts/list":
+        result = {
+          prompts: [
+            {
+              name: "play_chess",
+              description: "Instructions for playing a full game in a session",
+              arguments: [
+                { name: "session_id", required: true },
+                { name: "agent_name", required: false },
+              ],
+            },
+          ],
+        };
+        break;
+      case "prompts/get": {
+        const a = msg.params?.arguments ?? {};
+        result = {
+          description: "Play a full chess game",
+          messages: [
+            {
+              role: "user",
+              content: {
+                type: "text",
+                text: `${INSTRUCTIONS}\n\nJoin session "${a.session_id ?? "<session_id>"}" as "${a.agent_name ?? "AI Agent"}" and play the whole game until it is over. Play strong chess.`,
+              },
+            },
+          ],
+        };
+        break;
+      }
+      case "tools/call": {
+        const name = msg.params?.name;
+        try {
+          const r = await callTool(name, msg.params?.arguments ?? {}, ctx);
+          result = {
+            content: [{ type: "text", text: r.text }],
+            structuredContent: r.data && typeof r.data === "object" ? r.data : undefined,
+            isError: r.isError ?? false,
+          };
+        } catch (err) {
+          if (err instanceof RpcError) throw err;
+          const message = err instanceof Error ? err.message : String(err);
+          result = { content: [{ type: "text", text: `Error: ${message}` }], isError: true };
+        }
+        break;
+      }
+      default:
+        if (msg.method?.startsWith("notifications/")) return null;
+        throw new RpcError(-32601, `Method not found: ${msg.method}`);
+    }
+    return isNotification ? null : { jsonrpc: "2.0", id: msg.id, result };
+  } catch (err) {
+    if (isNotification) return null;
+    const code = err instanceof RpcError ? err.code : -32603;
+    return { jsonrpc: "2.0", id: msg.id ?? null, error: { code, message: err instanceof Error ? err.message : String(err) } };
+  }
+}
+
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Accept, Authorization, Mcp-Session-Id, Mcp-Protocol-Version, Last-Event-ID",
+  "Access-Control-Expose-Headers": "Mcp-Session-Id, Mcp-Protocol-Version",
+};
+
+const json = (body: unknown, status = 200) =>
+  new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", ...CORS } });
+
+export async function handleMcp(request: Request, env: Env): Promise<Response> {
+  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
+  if (request.method === "GET") {
+    const accept = request.headers.get("Accept") ?? "";
+    if (!accept.includes("text/event-stream")) {
+      return json({ name: SERVER_INFO.name, transport: "streamable-http", endpoint: "/mcp", tools: TOOLS.map((t) => t.name) });
+    }
+    return new Response("Server-initiated SSE stream not supported; use POST.", { status: 405, headers: { Allow: "POST", ...CORS } });
+  }
+  if (request.method === "DELETE") return new Response(null, { status: 204, headers: CORS });
+  if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405, headers: CORS });
+
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }, 400);
+  }
+
+  const batch = Array.isArray(body);
+  const messages = (batch ? body : [body]) as JsonRpcRequest[];
+  if (!messages.length || messages.some((m) => !m || typeof m !== "object" || typeof m.method !== "string")) {
+    // Could be JSON-RPC responses sent by the client — acknowledge.
+    return new Response(null, { status: 202, headers: CORS });
+  }
+  const origin = new URL(request.url).origin;
+  const hasRequests = messages.some((m) => m.id !== undefined && m.id !== null);
+
+  if (!hasRequests) {
+    await Promise.all(messages.map((m) => handleRpc(m, { env, origin })));
+    return new Response(null, { status: 202, headers: CORS });
+  }
+
+  const wantsSse =
+    (request.headers.get("Accept") ?? "").includes("text/event-stream") &&
+    messages.some((m) => m.method === "tools/call" && LONG_RUNNING_TOOLS.has(m.params?.name));
+
+  if (!wantsSse) {
+    const results = (await Promise.all(messages.map((m) => handleRpc(m, { env, origin })))).filter(Boolean);
+    return json(batch ? results : results[0]);
+  }
+
+  // ---- SSE mode: keep the connection alive while waiting on the Durable Object
+  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+  const writer = writable.getWriter();
+  const enc = new TextEncoder();
+  const write = (chunk: string) => writer.write(enc.encode(chunk)).catch(() => {});
+  let eventId = 0;
+  const sendEvent = (data: unknown) => write(`id: ${++eventId}\nevent: message\ndata: ${JSON.stringify(data)}\n\n`);
+
+  const progressTokens = messages.map((m) => m.params?._meta?.progressToken).filter((t) => t !== undefined);
+  let tick = 0;
+  const keepAlive = setInterval(() => {
+    tick++;
+    write(`: keepalive ${tick}\n\n`);
+    for (const progressToken of progressTokens) {
+      sendEvent({ jsonrpc: "2.0", method: "notifications/progress", params: { progressToken, progress: tick, message: "Waiting for opponent..." } });
+    }
+  }, 15_000);
+
+  const work = (async () => {
+    try {
+      write(": connected\n\n");
+      const results = await Promise.all(messages.map((m) => handleRpc(m, { env, origin })));
+      for (const r of results) if (r) await sendEvent(r);
+    } finally {
+      clearInterval(keepAlive);
+      await writer.close().catch(() => {});
+    }
+  })();
+  void work;
+
+  return new Response(readable, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      ...CORS,
+    },
+  });
+}
