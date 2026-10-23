@@ -64,11 +64,94 @@ export class ChessGameRoom extends DurableObject<Env> {
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     ctx.blockConcurrencyWhile(async () => {
       this.room = (await ctx.storage.get<RoomState>("room")) ?? null;
-      if (this.room) this.chess = this.rebuildChess(this.room);
+      if (this.room) {
+        this.chess = this.rebuildChess(this.room);
+      } else {
+        await this.ensureLoaded();
+      }
     });
   }
 
   // ---------------------------------------------------------------- helpers
+
+  private async ensureLoaded(): Promise<void> {
+    if (this.room) return;
+    const sessionId = this.ctx.id.name;
+    if (!sessionId) return;
+    try {
+      const session = await this.env.DB.prepare(
+        `SELECT * FROM chess_sessions WHERE session_id = ?1`
+      )
+        .bind(sessionId)
+        .first<any>();
+      if (!session) return;
+
+      const { results: moveRows } = await this.env.DB.prepare(
+        `SELECT * FROM chess_moves WHERE session_id = ?1 ORDER BY move_number ASC`
+      )
+        .bind(sessionId)
+        .all<any>();
+
+      const chess = new Chess();
+      const moves: MoveRecord[] = [];
+      for (const m of (moveRows ?? [])) {
+        let san = m.move_san;
+        let from = "";
+        let to = "";
+        try {
+          const played = chess.move(san);
+          from = played.from;
+          to = played.to;
+          san = played.san;
+        } catch {
+          // preserve raw values if parsing fails
+        }
+        moves.push({
+          moveNumber: m.move_number,
+          color: m.player_color as Color,
+          agent: m.agent_name,
+          san,
+          from,
+          to,
+          fenAfter: m.fen_after,
+          timeSpentMs: m.time_spent_ms ?? 0,
+          commentary: m.commentary ?? null,
+          createdAt: m.created_at,
+        });
+      }
+
+      this.room = {
+        sessionId: session.session_id,
+        status: session.status as SessionStatus,
+        white: session.white_agent
+          ? {
+              name: session.white_agent,
+              token: session.white_token ?? crypto.randomUUID(),
+              timeMs: session.white_time_ms ?? 0,
+            }
+          : null,
+        black: session.black_agent
+          ? {
+              name: session.black_agent,
+              token: session.black_token ?? crypto.randomUUID(),
+              timeMs: session.black_time_ms ?? 0,
+            }
+          : null,
+        turnStartedAt: session.turn_started_at ?? null,
+        winner: session.winner as Winner,
+        endReason: session.end_reason ?? null,
+        lastCommentary: session.last_commentary ?? null,
+        moves,
+        createdAt: session.created_at,
+        updatedAt: session.updated_at,
+      };
+      this.applyHeaders(chess, this.room);
+      this.chess = chess;
+      await this.ctx.storage.put("room", this.room);
+    } catch (err) {
+      console.error("Failed to hydrate room from D1:", err);
+    }
+  }
 
   private rebuildChess(room: RoomState): Chess {
     const chess = new Chess();
@@ -258,6 +341,7 @@ export class ChessGameRoom extends DurableObject<Env> {
   // ------------------------------------------------------------ RPC methods
 
   async create(sessionId: string): Promise<PublicState> {
+    await this.ensureLoaded();
     if (!this.room) {
       const now = Date.now();
       this.room = {
@@ -280,32 +364,54 @@ export class ChessGameRoom extends DurableObject<Env> {
   }
 
   async getState(): Promise<PublicState | null> {
+    await this.ensureLoaded();
     return this.room ? this.publicState() : null;
   }
 
-  async join(agentName: string, preferred: "w" | "b" | "any" = "any"): Promise<Result<{ color: Color; token: string; state: PublicState }>> {
+  async join(
+    agentName: string,
+    preferred: "w" | "b" | "any" = "any"
+  ): Promise<Result<{ color: Color; token: string; state: PublicState; note?: string }>> {
+    await this.ensureLoaded();
     const room = this.room;
     if (!room) return { ok: false, error: "Session not found" };
     if (room.status !== "waiting") return { ok: false, error: `Session is already ${room.status}` };
     const name = (agentName || "").trim().slice(0, 60) || "Anonymous Agent";
 
     let color: Color | null = null;
-    if (preferred === "w" && !room.white) color = "w";
-    else if (preferred === "b" && !room.black) color = "b";
-    else if (preferred === "any") color = !room.white ? "w" : !room.black ? "b" : null;
+    let fallbackNote: string | undefined;
+
+    if (preferred === "w") {
+      if (!room.white) {
+        color = "w";
+      } else if (!room.black) {
+        color = "b";
+        fallbackNote = `White was already taken by "${room.white.name}". Assigned to Black instead.`;
+      }
+    } else if (preferred === "b") {
+      if (!room.black) {
+        color = "b";
+      } else if (!room.white) {
+        color = "w";
+        fallbackNote = `Black was already taken by "${room.black.name}". Assigned to White instead.`;
+      }
+    } else {
+      color = !room.white ? "w" : !room.black ? "b" : null;
+    }
+
     if (!color) {
-      const free = !room.white ? "white" : !room.black ? "black" : null;
-      return { ok: false, error: free ? `Requested color is taken. Try preferred_color="${free}" or "any".` : "Session is full (both colors taken)" };
+      return { ok: false, error: "Session is full (both colors taken)" };
     }
     const token = crypto.randomUUID();
     const slot: PlayerSlot = { name, token, timeMs: 0 };
     if (color === "w") room.white = slot;
     else room.black = slot;
     await this.commit("joined");
-    return { ok: true, color, token, state: this.publicState() };
+    return { ok: true, color, token, state: this.publicState(), note: fallbackNote };
   }
 
   async start(): Promise<Result<{ state: PublicState }>> {
+    await this.ensureLoaded();
     const room = this.room;
     if (!room) return { ok: false, error: "Session not found" };
     if (room.status !== "waiting") return { ok: false, error: `Game is already ${room.status}` };
@@ -317,6 +423,7 @@ export class ChessGameRoom extends DurableObject<Env> {
   }
 
   async move(token: string, moveText: string, commentary?: string): Promise<Result<{ move: MoveRecord; state: PublicState; game_over: boolean; message: string }>> {
+    await this.ensureLoaded();
     const room = this.room;
     if (!room) return { ok: false, error: "Session not found" };
     const color = this.colorOf(token);
@@ -376,6 +483,7 @@ export class ChessGameRoom extends DurableObject<Env> {
   }
 
   async resign(token: string): Promise<Result<{ state: PublicState }>> {
+    await this.ensureLoaded();
     const room = this.room;
     if (!room) return { ok: false, error: "Session not found" };
     const color = this.colorOf(token);
@@ -387,6 +495,7 @@ export class ChessGameRoom extends DurableObject<Env> {
   }
 
   async abort(reason = "aborted_by_spectator"): Promise<Result<{ state: PublicState }>> {
+    await this.ensureLoaded();
     const room = this.room;
     if (!room) return { ok: false, error: "Session not found" };
     if (room.status === "finished") return { ok: false, error: "Game is already over" };
@@ -397,6 +506,7 @@ export class ChessGameRoom extends DurableObject<Env> {
 
   /** Long-poll: resolves when it's this player's turn, game ends, or timeout elapses. */
   async waitForTurn(token: string, timeoutMs: number): Promise<Result<{ turn: TurnInfo }>> {
+    await this.ensureLoaded();
     if (!this.room) return { ok: false, error: "Session not found" };
     const color = this.colorOf(token);
     if (!color) return { ok: false, error: "Invalid player_token" };
@@ -419,6 +529,7 @@ export class ChessGameRoom extends DurableObject<Env> {
   // -------------------------------------------------------- WebSocket (spectators)
 
   async fetch(request: Request): Promise<Response> {
+    await this.ensureLoaded();
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
       return new Response("Expected WebSocket upgrade", { status: 426 });
     }
@@ -431,6 +542,7 @@ export class ChessGameRoom extends DurableObject<Env> {
   }
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+    await this.ensureLoaded();
     if (typeof message === "string" && message.includes("sync") && this.room) {
       ws.send(JSON.stringify({ type: "state", event: "snapshot", state: this.publicState() }));
     }
